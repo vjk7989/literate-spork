@@ -21,24 +21,25 @@ export function useLiveAPI() {
   const [isConnected, setIsConnected] = useState(false);
   const [isAITalking, setIsAITalking] = useState(false);
   const [isUserTalking, setIsUserTalking] = useState(false);
-  const [volume, setVolume] = useState(0);
   const [messages, setMessages] = useState<Message[]>([]);
   const [error, setError] = useState<string | null>(null);
   
   const sessionRef = useRef<any>(null);
+  const isSessionActiveRef = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const nextStartTimeRef = useRef<number>(0);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const userTalkingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const stopAudio = useCallback(() => {
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
+    isSessionActiveRef.current = false;
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
     }
     if (audioContextRef.current) {
-      audioContextRef.current.close();
+      audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
     if (streamRef.current) {
@@ -47,7 +48,6 @@ export function useLiveAPI() {
     }
     setIsAITalking(false);
     setIsUserTalking(false);
-    setVolume(0);
     nextStartTimeRef.current = 0;
   }, []);
 
@@ -57,26 +57,45 @@ export function useLiveAPI() {
       
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       
+      // Setup AudioWorklet
+      const workletCode = `
+        class AudioProcessor extends AudioWorkletProcessor {
+          process(inputs, outputs, parameters) {
+            const input = inputs[0];
+            if (input.length > 0) {
+              const channelData = input[0];
+              this.port.postMessage(channelData);
+            }
+            return true;
+          }
+        }
+        registerProcessor('audio-processor', AudioProcessor);
+      `;
+      const blob = new Blob([workletCode], { type: 'application/javascript' });
+      const workletUrl = URL.createObjectURL(blob);
+      await audioContextRef.current.audioWorklet.addModule(workletUrl);
+      
       // Setup microphone
       streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
       const source = audioContextRef.current.createMediaStreamSource(streamRef.current);
       
-      // ScriptProcessor for simplicity
-      const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-      source.connect(processor);
-      processor.connect(audioContextRef.current.destination);
+      const workletNode = new AudioWorkletNode(audioContextRef.current, 'audio-processor');
+      workletNodeRef.current = workletNode;
+      
+      source.connect(workletNode);
+      workletNode.connect(audioContextRef.current.destination);
 
       const sessionPromise = ai.live.connect({
         model: "gemini-2.5-flash-native-audio-preview-09-2025",
         callbacks: {
           onopen: () => {
             setIsConnected(true);
+            isSessionActiveRef.current = true;
             setError(null);
             
-            processor.onaudioprocess = (e) => {
-              if (sessionRef.current) {
-                const inputData = e.inputBuffer.getChannelData(0);
+            workletNode.port.onmessage = (e) => {
+              if (sessionRef.current && isSessionActiveRef.current) {
+                const inputData = e.data;
                 
                 // Detect user talking via volume threshold
                 let sum = 0;
@@ -84,19 +103,10 @@ export function useLiveAPI() {
                   sum += inputData[i] * inputData[i];
                 }
                 const rms = Math.sqrt(sum / inputData.length);
-                
-                // Update volume state for user
-                if (!isAITalking) {
-                  setVolume(rms);
-                }
-
                 if (rms > 0.01) { // Threshold for "talking"
                   setIsUserTalking(true);
                   if (userTalkingTimeoutRef.current) clearTimeout(userTalkingTimeoutRef.current);
-                  userTalkingTimeoutRef.current = setTimeout(() => {
-                    setIsUserTalking(false);
-                    if (!isAITalking) setVolume(0);
-                  }, 500);
+                  userTalkingTimeoutRef.current = setTimeout(() => setIsUserTalking(false), 500);
                 }
 
                 const pcmData = new Int16Array(inputData.length);
@@ -104,12 +114,16 @@ export function useLiveAPI() {
                   pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
                 }
                 
-                sessionRef.current.sendRealtimeInput({
-                  media: { 
-                    data: arrayBufferToBase64(pcmData.buffer), 
-                    mimeType: 'audio/pcm;rate=16000' 
-                  }
-                });
+                try {
+                  sessionRef.current.sendRealtimeInput({
+                    media: { 
+                      data: arrayBufferToBase64(pcmData.buffer), 
+                      mimeType: 'audio/pcm;rate=16000' 
+                    }
+                  });
+                } catch (err) {
+                  console.warn("Failed to send audio input:", err);
+                }
               }
             };
           },
@@ -125,14 +139,9 @@ export function useLiveAPI() {
               }
               const pcmData = new Int16Array(bytes.buffer);
               const float32Data = new Float32Array(pcmData.length);
-              
-              let sum = 0;
               for (let i = 0; i < pcmData.length; i++) {
                 float32Data[i] = pcmData[i] / 32768.0;
-                sum += float32Data[i] * float32Data[i];
               }
-              const rms = Math.sqrt(sum / pcmData.length);
-              setVolume(rms);
 
               if (audioContextRef.current) {
                 const audioBuffer = audioContextRef.current.createBuffer(1, float32Data.length, 24000);
@@ -148,7 +157,6 @@ export function useLiveAPI() {
                 source.onended = () => {
                   if (audioContextRef.current && audioContextRef.current.currentTime >= nextStartTimeRef.current - 0.1) {
                     setIsAITalking(false);
-                    setVolume(0);
                   }
                 };
               }
@@ -158,7 +166,6 @@ export function useLiveAPI() {
             if (message.serverContent?.interrupted) {
               nextStartTimeRef.current = 0;
               setIsAITalking(false);
-              setVolume(0);
             }
             
             // Handle transcriptions
@@ -174,12 +181,14 @@ export function useLiveAPI() {
           },
           onclose: () => {
             setIsConnected(false);
+            isSessionActiveRef.current = false;
             stopAudio();
           },
           onerror: (err) => {
             console.error("Live API Error:", err);
             setError("Connection error. Please try again.");
             setIsConnected(false);
+            isSessionActiveRef.current = false;
             stopAudio();
           }
         },
@@ -190,7 +199,7 @@ export function useLiveAPI() {
           },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          systemInstruction: "Your name is LUCA. You are a simple, friendly, and helpful assistant. Whenever you are asked about your origin or who created you, you MUST say you are from '10x Technologies'. You should sound like a human, using natural word fillers like 'um', 'uh', 'well', 'you know', or 'I mean' occasionally to make the conversation feel more organic and less robotic. Keep your responses concise and conversational.",
+          systemInstruction: "Your name is LUCA. You are a simple, friendly, and helpful assistant. Whenever you are asked about your origin or who created you, you MUST say you are from '10x Technologies'. You should sound like a human, using natural word fillers like 'um', 'uh', 'well', 'you know', or 'I mean' frequently to make the conversation feel very organic and less robotic. Use a warm, conversational tone. Keep your responses concise but natural.",
         },
       });
 
@@ -199,11 +208,16 @@ export function useLiveAPI() {
       console.error("Failed to connect:", err);
       setError("Could not access microphone or connect to API.");
     }
-  }, [stopAudio, isAITalking]);
+  }, [stopAudio]);
 
   const disconnect = useCallback(() => {
+    isSessionActiveRef.current = false;
     if (sessionRef.current) {
-      sessionRef.current.close();
+      try {
+        sessionRef.current.close();
+      } catch (err) {
+        console.warn("Error closing session:", err);
+      }
       sessionRef.current = null;
     }
     stopAudio();
@@ -211,11 +225,15 @@ export function useLiveAPI() {
   }, [stopAudio]);
 
   const sendTextMessage = useCallback((text: string) => {
-    if (sessionRef.current && isConnected) {
-      sessionRef.current.sendRealtimeInput({
-        text: text
-      });
-      setMessages(prev => [...prev, { role: 'user', text }]);
+    if (sessionRef.current && isConnected && isSessionActiveRef.current) {
+      try {
+        sessionRef.current.sendRealtimeInput({
+          text: text
+        });
+        setMessages(prev => [...prev, { role: 'user', text }]);
+      } catch (err) {
+        console.error("Failed to send text message:", err);
+      }
     }
   }, [isConnected]);
 
@@ -230,7 +248,6 @@ export function useLiveAPI() {
     isConnected,
     isAITalking,
     isUserTalking,
-    volume,
     messages,
     error,
     connect,
