@@ -1,0 +1,5 @@
+{
+  "name": "LUCA Voice Assistant",
+  "description": "A simple voice-activated assistant named LUCA, powered by buckleson.",
+  "requestFramePermissions": ["microphone"]
+}
